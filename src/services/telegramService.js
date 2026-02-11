@@ -3,25 +3,26 @@ const axios = require("axios");
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const api = `https://api.telegram.org/bot${token}`;
 
+// Escapa MarkdownV2 (Telegram)
+function escapeMarkdownV2(text) {
+  // Caracteres que Telegram MarkdownV2 requiere escapar:
+  // _ * [ ] ( ) ~ ` > # + - = | { } . !
+  return String(text ?? "").replace(/([_*$begin:math:display$$end:math:display$$begin:math:text$$end:math:text$~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+// Para texto dentro de code block o inline code es distinto.
+// Truco práctico: si vas a mandar un bloque de código, NO lo escapes por dentro,
+// mejor envíalo como preformateado sin parsear o en HTML.
+// Aquí vamos a evitar code blocks en mensajes normales.
 async function sendMessage(chatId, text, opts = {}) {
+  const safe = escapeMarkdownV2(text);
+
   return axios.post(`${api}/sendMessage`, {
     chat_id: chatId,
-    text,
-    parse_mode: "Markdown",
+    text: safe,
+    parse_mode: "MarkdownV2",
     ...opts,
   });
 }
 
-async function getFile(fileId) {
-  const { data } = await axios.get(`${api}/getFile`, { params: { file_id: fileId } });
-  if (!data.ok) throw new Error("getFile_failed");
-  return data.result; // {file_path,...}
-}
-
-async function downloadFile(filePath) {
-  const url = `https://api.telegram.org/file/bot${token}/${filePath}`;
-  const res = await axios.get(url, { responseType: "arraybuffer" });
-  return Buffer.from(res.data);
-}
-
-module.exports = { sendMessage, getFile, downloadFile };
+module.exports = { sendMessage, escapeMarkdownV2 };
