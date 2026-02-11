@@ -23,12 +23,16 @@ function safeJsonParse(str) {
     const a = s.indexOf("{");
     const b = s.lastIndexOf("}");
     if (a !== -1 && b !== -1 && b > a) {
-      try { return JSON.parse(s.slice(a, b + 1)); } catch (_) {}
+      try {
+        return JSON.parse(s.slice(a, b + 1));
+      } catch (_) {}
     }
     const c = s.indexOf("[");
     const d = s.lastIndexOf("]");
     if (c !== -1 && d !== -1 && d > c) {
-      try { return JSON.parse(s.slice(c, d + 1)); } catch (_) {}
+      try {
+        return JSON.parse(s.slice(c, d + 1));
+      } catch (_) {}
     }
     return null;
   }
@@ -53,18 +57,15 @@ function parseLinesFromText(text) {
   return items;
 }
 
-// Comprime/rescala para que Vision no falle por tamaño
+// Comprime/rescala para Vision (estable en Render)
 async function normalizeImageForVision(buffer) {
-  // Convierte cualquier cosa a jpeg optimizado
-  // max 1600px para mantener legible y estable
   return sharp(buffer)
-    .rotate() // respeta orientación EXIF
+    .rotate()
     .resize({ width: 1600, height: 1600, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 82 })
     .toBuffer();
 }
 
-// Prompt ultra específico para TUS formatos
 function buildSystemPrompt(mode) {
   if (mode === "semana") {
     return (
@@ -79,7 +80,7 @@ function buildSystemPrompt(mode) {
       `- Ignora encabezados y renglones de sección/categoría.\n` +
       `- Para cada producto:\n` +
       `   - Si la columna TOTAL tiene un número, ponlo en "total".\n` +
-      `   - Si TOTAL está vacío pero Local/Bodega tienen números, pon local y bodega; total puede ir null.\n` +
+      `   - Si TOTAL no es legible pero Local/Bodega sí, pon local y bodega; total puede ir null.\n` +
       `- Si no hay número en ninguna columna, omite esa fila.\n` +
       `- Si no puedes leer nada, devuelve {"items":[]}.\n`
     );
@@ -101,26 +102,30 @@ function buildSystemPrompt(mode) {
 }
 
 /**
- * Vision → items normalizados a [{rawName, qty}]
+ * Vision -> [{rawName, qty}]
  */
 async function extractItemsFromBuffer({ mode, buffer, mimeType }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-  // Convertimos a JPG optimizado siempre (más estable)
+  // Convertimos todo a JPEG optimizado (aunque llegue como document/octet-stream)
   const img = await normalizeImageForVision(buffer);
   const b64 = img.toString("base64");
   const dataUrl = `data:image/jpeg;base64,${b64}`;
 
   const system = buildSystemPrompt(mode);
 
+  // ✅ IMPORTANTE: En Responses API, el tipo correcto es input_text (NO "text")
   const resp = await client.responses.create({
-    model: "gpt-4.1-mini", // más rápido/barato y soporta visión
+    model: "gpt-4.1-mini",
     input: [
-      { role: "system", content: [{ type: "text", text: system }] },
+      {
+        role: "system",
+        content: [{ type: "input_text", text: system }],
+      },
       {
         role: "user",
         content: [
-          { type: "text", text: "Extrae todas las filas de producto del formato y devuelve SOLO el JSON indicado." },
+          { type: "input_text", text: "Extrae todas las filas de producto del formato y devuelve SOLO el JSON indicado." },
           { type: "input_image", image_url: dataUrl },
         ],
       },
@@ -130,7 +135,6 @@ async function extractItemsFromBuffer({ mode, buffer, mimeType }) {
   const text = resp.output_text || "";
   const parsed = safeJsonParse(text);
 
-  // Normalización final
   const out = [];
 
   if (mode === "semana") {
@@ -143,14 +147,12 @@ async function extractItemsFromBuffer({ mode, buffer, mimeType }) {
       const bodega = toNum(it?.bodega);
       let total = toNum(it?.total);
 
-      // Si no viene total, lo calculamos si hay local/bodega
+      // Si total viene null, lo calculamos (local + bodega) si hay algo
       if (total === null && (local !== null || bodega !== null)) {
         total = (local ?? 0) + (bodega ?? 0);
       }
 
-      // OJO: permitimos 0
-      if (total === null) continue;
-
+      if (total === null) continue; // omitimos filas sin números
       out.push({ rawName, qty: total });
     }
     return out;
@@ -164,6 +166,7 @@ async function extractItemsFromBuffer({ mode, buffer, mimeType }) {
     if (!rawName || qty === null) continue;
     out.push({ rawName, qty });
   }
+
   return out;
 }
 
