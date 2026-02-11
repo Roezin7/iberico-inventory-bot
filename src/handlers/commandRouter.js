@@ -10,20 +10,27 @@ const {
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText, extractItemsFromBuffer } = require("../services/parserService");
 
-// Estado simple por chat (modo actual)
-const state = new Map(); // chatId -> { mode: 'semana'|'ingreso'|null }
+// state: chatId -> { mode, batch: { linesByProductId: Map<number, number>, rawSeen: number } }
+const state = new Map();
 
-function setMode(chatId, mode) {
-  if (!mode) state.delete(chatId);
-  else state.set(chatId, { mode });
+function startBatch(chatId, mode) {
+  state.set(chatId, {
+    mode,
+    batch: {
+      // product_id -> qty acumulada (sumamos por si un producto aparece en 2 fotos)
+      linesByProductId: new Map(),
+      rawSeen: 0,
+    },
+  });
 }
-function getMode(chatId) {
-  return state.get(chatId)?.mode || null;
+function clearBatch(chatId) {
+  state.delete(chatId);
+}
+function getState(chatId) {
+  return state.get(chatId) || null;
 }
 
-// Helpers
 function pickTelegramFileFromMessage(message) {
-  // Foto: toma la de mayor resolución (última)
   if (message.photo?.length) {
     const p = message.photo[message.photo.length - 1];
     return {
@@ -35,8 +42,6 @@ function pickTelegramFileFromMessage(message) {
       kind: "photo",
     };
   }
-
-  // Documento: puede ser imagen o PDF
   if (message.document) {
     const d = message.document;
     return {
@@ -48,18 +53,34 @@ function pickTelegramFileFromMessage(message) {
       kind: "document",
     };
   }
-
   return null;
+}
+
+function mergeLines(batch, resolvedLines /* [{product_id, qty}] */) {
+  for (const l of resolvedLines) {
+    const prev = Number(batch.linesByProductId.get(l.product_id) || 0);
+    batch.linesByProductId.set(l.product_id, prev + Number(l.qty || 0));
+  }
+}
+
+function batchToLines(batch) {
+  return Array.from(batch.linesByProductId.entries()).map(([product_id, qty]) => ({
+    product_id,
+    qty,
+  }));
 }
 
 async function handleCommand(chatId, text) {
   const cmd = String(text || "").trim().split(/\s+/)[0];
+  const st = getState(chatId);
 
   if (cmd === "/menu") {
     const html =
       `<b>Ibérico Inventario</b>\n\n` +
-      `<code>/semana</code> — subir inventario semanal (foto o texto)\n` +
-      `<code>/ingreso</code> — subir compras (foto o texto)\n` +
+      `<code>/semana</code> — iniciar lote inventario semanal (manda 2 fotos: Alcohol y Cocina, luego <code>/fin</code>)\n` +
+      `<code>/ingreso</code> — iniciar lote compras (manda 1 o más fotos, luego <code>/fin</code>)\n` +
+      `<code>/fin</code> — guardar lote actual\n` +
+      `<code>/cancel</code> — cancelar lote actual\n\n` +
       `<code>/stock</code> — ver stock actual\n` +
       `<code>/compras</code> — lista de compras sugerida\n` +
       `<code>/compras_tienda</code> — compras sugeridas por tienda`;
@@ -67,23 +88,56 @@ async function handleCommand(chatId, text) {
     return sendMessage(chatId, html);
   }
 
+  if (cmd === "/cancel") {
+    if (!st) return sendMessage(chatId, `No hay nada que cancelar. Usa <code>/menu</code>.`);
+    clearBatch(chatId);
+    return sendMessage(chatId, `Lote cancelado ✅`);
+  }
+
+  if (cmd === "/fin") {
+    if (!st) return sendMessage(chatId, `No hay lote activo. Usa <code>/semana</code> o <code>/ingreso</code>.`);
+
+    const lines = batchToLines(st.batch);
+    if (!lines.length) {
+      clearBatch(chatId);
+      return sendMessage(chatId, `Lote vacío. Cancelo ✅`);
+    }
+
+    if (st.mode === "semana") {
+      await inventory.resetCycleAndCreateSnapshot(lines);
+      clearBatch(chatId);
+      return sendMessage(chatId, `Inventario semanal guardado ✅\nUsa <code>/compras</code> o <code>/stock</code>.`);
+    }
+
+    if (st.mode === "ingreso") {
+      await inventory.addPurchase(lines);
+      clearBatch(chatId);
+      return sendMessage(chatId, `Compras guardadas ✅\nUsa <code>/stock</code>.`);
+    }
+
+    clearBatch(chatId);
+    return sendMessage(chatId, `Modo inválido. Usa <code>/menu</code>.`);
+  }
+
   if (cmd === "/semana") {
-    setMode(chatId, "semana");
+    startBatch(chatId, "semana");
     return sendMessage(
       chatId,
-      `Envíame el <b>inventario semanal</b>.\n\n` +
-        `Puedes mandar <b>foto</b> del formato o pegar texto así:\n` +
-        `<pre>Coca = 2\nAbsolut 750 ml = 1.5</pre>`
+      `Lote semanal iniciado ✅\n` +
+        `Envíame <b>foto Alcohol</b> y luego <b>foto Cocina</b>.\n` +
+        `Cuando termines: <code>/fin</code>\n` +
+        `Si te equivocas: <code>/cancel</code>`
     );
   }
 
   if (cmd === "/ingreso") {
-    setMode(chatId, "ingreso");
+    startBatch(chatId, "ingreso");
     return sendMessage(
       chatId,
-      `Envíame las <b>compras/ingresos</b>.\n\n` +
-        `Puedes mandar <b>foto</b> del formato o texto:\n` +
-        `<pre>Coca = 6\nTonica = 12</pre>`
+      `Lote de compras iniciado ✅\n` +
+        `Envíame la(s) foto(s) de compras (Alcohol / Cocina si aplica).\n` +
+        `Cuando termines: <code>/fin</code>\n` +
+        `Si te equivocas: <code>/cancel</code>`
     );
   }
 
@@ -92,13 +146,7 @@ async function handleCommand(chatId, text) {
     if (rows?.error === "no_snapshot") {
       return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
-
-    const lines = rows.map((r) => {
-      const name = escapeHtml(r.name);
-      const qty = Number(r.stock_actual || 0).toFixed(2);
-      return `• ${name}: <b>${qty}</b>`;
-    });
-
+    const lines = rows.map((r) => `• ${escapeHtml(r.name)}: <b>${Number(r.stock_actual || 0).toFixed(2)}</b>`);
     return sendMessage(chatId, `<b>Stock actual</b>\n\n${lines.join("\n")}`);
   }
 
@@ -107,13 +155,7 @@ async function handleCommand(chatId, text) {
     if (rows?.error === "no_snapshot") {
       return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
-
-    const lines = rows.map((r) => {
-      const name = escapeHtml(r.name);
-      const falt = Number(r.faltante || 0).toFixed(2);
-      return `• ${name}: <b>${falt}</b>`;
-    });
-
+    const lines = rows.map((r) => `• ${escapeHtml(r.name)}: <b>${Number(r.faltante || 0).toFixed(2)}</b>`);
     return sendMessage(chatId, `<b>Compras sugeridas</b>\n\n${lines.join("\n")}`);
   }
 
@@ -142,24 +184,25 @@ async function handleCommand(chatId, text) {
     return sendMessage(chatId, out.trim());
   }
 
+  // Si hay lote activo, recordatorio útil
+  if (st) {
+    return sendMessage(chatId, `Tienes un lote activo (<code>${escapeHtml(st.mode)}</code>). Envía foto o <code>/fin</code>.`);
+  }
+
   return sendMessage(chatId, `No entendí. Usa <code>/menu</code>.`);
 }
 
 async function handleNonCommand(chatId, message) {
-  const mode = getMode(chatId);
+  const st = getState(chatId);
 
-  // Si manda algo sin modo
-  if (!mode) {
+  // Si manda archivo sin lote
+  if (!st) {
     const hasFile = !!pickTelegramFileFromMessage(message);
-    if (hasFile) {
-      return sendMessage(chatId, `Antes dime qué es: <code>/semana</code> o <code>/ingreso</code>.`);
-    }
-    return sendMessage(chatId, `Usa <code>/menu</code> para ver comandos.`);
+    if (hasFile) return sendMessage(chatId, `Primero inicia: <code>/semana</code> o <code>/ingreso</code>.`);
+    return sendMessage(chatId, `Usa <code>/menu</code>.`);
   }
 
-  // =========================
-  // 1) TEXTO: "Producto = cantidad"
-  // =========================
+  // TEXTO (permite sumar al lote)
   if (message.text) {
     const parsed = parseLinesFromText(message.text);
     if (!parsed.length) {
@@ -170,154 +213,108 @@ async function handleNonCommand(chatId, message) {
     const map = await inventory.resolveProductsByNames(names);
 
     const missing = [];
-    const lines = [];
+    const resolvedLines = [];
 
     for (const it of parsed) {
       const resolved = map.get(it.rawName);
       if (!resolved) missing.push(it.rawName);
-      else lines.push({ product_id: resolved.product_id, qty: it.qty });
+      else resolvedLines.push({ product_id: resolved.product_id, qty: it.qty });
     }
 
     if (missing.length) {
       return sendMessage(
         chatId,
-        `<b>No reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\n` +
-          `Corrige el nombre o agrega alias.`
+        `<b>No reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\nAgrega alias y reintenta.`
       );
     }
 
-    if (mode === "semana") {
-      await inventory.resetCycleAndCreateSnapshot(lines);
-      setMode(chatId, null);
-      return sendMessage(chatId, `Inventario semanal guardado ✅\nUsa <code>/compras</code> o <code>/stock</code>.`);
-    }
+    mergeLines(st.batch, resolvedLines);
+    st.batch.rawSeen += resolvedLines.length;
 
-    if (mode === "ingreso") {
-      await inventory.addPurchase(lines);
-      setMode(chatId, null);
-      return sendMessage(chatId, `Compras guardadas ✅\nUsa <code>/stock</code>.`);
-    }
+    return sendMessage(
+      chatId,
+      `Agregado al lote ✅ (${st.batch.linesByProductId.size} productos acumulados)\nCuando termines: <code>/fin</code>`
+    );
   }
 
-  // =========================
-  // 2) FOTO / DOCUMENTO: OpenAI Vision
-  // =========================
+  // FOTO / DOCUMENTO
   const fileMeta = pickTelegramFileFromMessage(message);
   if (!fileMeta) {
-    return sendMessage(chatId, `Mándame una <b>foto</b> del formato o texto <code>Producto = cantidad</code>.`);
+    return sendMessage(chatId, `Envíame una <b>foto</b> del formato o texto <pre>Producto = cantidad</pre>.`);
   }
 
-  // Guardar ingest (debug + reintentos)
+  // Log ingest
   const ingest = await db.query(
     `insert into ingests (chat_id, mode, telegram_file_id, telegram_file_unique_id, mime_type, file_name, file_size)
      values ($1,$2,$3,$4,$5,$6,$7)
      returning id`,
-    [
-      chatId,
-      mode,
-      fileMeta.fileId,
-      fileMeta.fileUniqueId,
-      fileMeta.mimeType,
-      fileMeta.fileName,
-      fileMeta.fileSize || null,
-    ]
+    [chatId, st.mode, fileMeta.fileId, fileMeta.fileUniqueId, fileMeta.mimeType, fileMeta.fileName, fileMeta.fileSize || null]
   );
   const ingestId = ingest.rows[0].id;
 
-  // Aviso inmediato
   await sendMessage(
     chatId,
-    `Procesando con IA… 🤖\n` +
-      `Modo: <code>${escapeHtml(mode)}</code>\n` +
-      `Archivo: <code>${escapeHtml(fileMeta.fileName)}</code>\n` +
-      `Ingest: <code>${ingestId}</code>`
+    `Procesando con IA… 🤖\nModo: <code>${escapeHtml(st.mode)}</code>\nArchivo: <code>${escapeHtml(fileMeta.fileName)}</code>\nIngest: <code>${ingestId}</code>`
   );
 
   try {
-    // Descargar binario desde Telegram
     const f = await getFile(fileMeta.fileId);
     const buffer = await downloadFile(f.file_path);
 
-    // 1) IA extrae items [{ rawName, qty }]
     const extracted = await extractItemsFromBuffer({
-      mode,
+      mode: st.mode,
       buffer,
       mimeType: fileMeta.mimeType,
     });
 
     if (!extracted?.length) {
-      await db.query(`update ingests set status='failed', error=$2 where id=$1`, [
-        ingestId,
-        "extractor_returned_empty",
-      ]);
-      return sendMessage(
-        chatId,
-        `No pude leer esa imagen 😵‍💫\n` +
-          `Tip: mejor luz, foto derecha y que se vea completa la tabla.\n` +
-          `También puedes pegar texto: <pre>Coca = 2</pre>`
-      );
+      await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, "extractor_returned_empty"]);
+      return sendMessage(chatId, `No pude leer esa foto 😵‍💫\nTip: más luz, recta, completa.\nO pega texto <pre>Coca = 2</pre>`);
     }
 
-    // 2) Resolver productos por name/alias
     const names = extracted.map((x) => x.rawName);
     const map = await inventory.resolveProductsByNames(names);
 
     const missing = [];
-    const lines = [];
+    const resolvedLines = [];
 
     for (const it of extracted) {
       const resolved = map.get(it.rawName);
       if (!resolved) missing.push(it.rawName);
-      else lines.push({ product_id: resolved.product_id, qty: it.qty });
+      else resolvedLines.push({ product_id: resolved.product_id, qty: it.qty });
     }
 
     if (missing.length) {
-      await db.query(`update ingests set status='failed', error=$2 where id=$1`, [
-        ingestId,
-        `missing_products:${missing.join(",")}`,
-      ]);
+      await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, `missing_products:${missing.join(",")}`]);
       return sendMessage(
         chatId,
-        `<b>La IA leyó la foto, pero no reconocí estos productos:</b>\n` +
-          `${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\n` +
-          `Solución: agrégalos como alias en la tabla <code>product_aliases</code> y reintenta.\n` +
-          `Ingest: <code>${ingestId}</code>`
+        `<b>Leí la foto, pero no reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\n` +
+          `Agrega alias y reintenta.\nIngest: <code>${ingestId}</code>`
       );
     }
 
-    // 3) Guardar a DB según modo
-    if (mode === "semana") {
-      await inventory.resetCycleAndCreateSnapshot(lines);
-      setMode(chatId, null);
-      await db.query(`update ingests set status='processed' where id=$1`, [ingestId]);
-      return sendMessage(chatId, `Inventario semanal guardado ✅\nUsa <code>/compras</code> o <code>/stock</code>.`);
-    }
+    mergeLines(st.batch, resolvedLines);
+    st.batch.rawSeen += resolvedLines.length;
 
-    if (mode === "ingreso") {
-      await inventory.addPurchase(lines);
-      setMode(chatId, null);
-      await db.query(`update ingests set status='processed' where id=$1`, [ingestId]);
-      return sendMessage(chatId, `Compras guardadas ✅\nUsa <code>/stock</code>.`);
-    }
+    await db.query(`update ingests set status='processed' where id=$1`, [ingestId]);
 
-    // fallback (no debería pasar)
-    await db.query(`update ingests set status='failed', error=$2 where id=$1`, [
-      ingestId,
-      "unknown_mode",
-    ]);
-    return sendMessage(chatId, `Modo inválido. Usa <code>/semana</code> o <code>/ingreso</code>.`);
-  } catch (e) {
-    console.error("photo pipeline error:", e?.response?.data || e?.message || e);
-    await db.query(`update ingests set status='failed', error=$2 where id=$1`, [
-      ingestId,
-      e?.message || "unknown_error",
-    ]);
     return sendMessage(
       chatId,
-      `Falló el procesamiento 😵\n` +
-        `Ingest: <code>${ingestId}</code>\n` +
-        `Tip: intenta otra foto (más luz, sin sombras, centrada).`
+      `Foto agregada al lote ✅\n` +
+        `Acumulado: <b>${st.batch.linesByProductId.size}</b> productos\n` +
+        `Cuando termines: <code>/fin</code>`
     );
+  } catch (e) {
+    const msg = e?.message || "unknown_error";
+    await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, msg]);
+
+    // Caso típico: PDF
+    if (String(msg).startsWith("unsupported_mime:")) {
+      return sendMessage(chatId, `Eso parece PDF/documento raro.\nEnvíalo como <b>Foto</b> (no archivo) y reintenta ✅`);
+    }
+
+    console.error("photo pipeline error:", e?.response?.data || msg);
+    return sendMessage(chatId, `Falló el procesamiento 😵\nIngest: <code>${ingestId}</code>\nTip: intenta otra foto con mejor luz.`);
   }
 }
 
