@@ -1,51 +1,9 @@
 // src/handlers/commandRouter.js
-const { sendMessage } = require("../services/telegramService");
+const { sendMessage, escapeHtml } = require("../services/telegramService");
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText } = require("../services/parserService");
 
-// =========================
-// MarkdownV2 (Telegram) - ÚNICO escape correcto
-// Escapa: _ * [ ] ( ) ~ ` > # + - = | { } . ! \
-// =========================
-function md(text) {
-  return String(text ?? "").replace(/([_*$begin:math:display$$end:math:display$$begin:math:text$$end:math:text$~`>#+\-=|{}.!\\])/g, "\\$1");
-}
-
-function b(text) {
-  return `*${md(text)}*`;
-}
-
-function code(text) {
-  // Inline code: lo más seguro es escaparlo normal también
-  // (Telegram es muy quisquilloso con backticks)
-  return `\`${md(text)}\``;
-}
-
-function fmtNum(n) {
-  const num = Number(n);
-  return Number.isFinite(num) ? num.toFixed(2) : "0.00";
-}
-
-// Telegram ~4096 chars
-const TG_MAX = 3800;
-function chunkBySize(text, max = TG_MAX) {
-  const parts = [];
-  let buf = "";
-  for (const line of String(text || "").split("\n")) {
-    if (buf.length + line.length + 1 > max) {
-      if (buf.trim()) parts.push(buf.trimEnd());
-      buf = "";
-    }
-    buf += line + "\n";
-  }
-  if (buf.trim()) parts.push(buf.trimEnd());
-  return parts.length ? parts : [""];
-}
-
-// =========================
-// State
-// =========================
-const state = new Map(); // chatId -> { mode: 'semana'|'ingreso' }
+const state = new Map(); // chatId -> { mode: 'semana'|'ingreso'|null }
 
 function setMode(chatId, mode) {
   if (!mode) state.delete(chatId);
@@ -55,129 +13,107 @@ function getMode(chatId) {
   return state.get(chatId)?.mode || null;
 }
 
-// =========================
-// Commands
-// =========================
 async function handleCommand(chatId, text) {
   const cmd = String(text || "").trim().split(/\s+/)[0];
 
   if (cmd === "/menu") {
-    // OJO: aquí NO escribimos escapes a mano.
-    // Todo lo “normal” va con md(), y el formato solo lo ponemos con *...* y `...`
-    const msg = [
-      b("Ibérico Inventario"),
-      "",
-      `${md("/semana")} — ${md("subir inventario semanal")} ${md("(texto por ahora)")}`,
-      `${md("/ingreso")} — ${md("subir compras")} ${md("(texto por ahora)")}`,
-      `${md("/stock")} — ${md("ver stock actual")}`,
-      `${md("/compras")} — ${md("lista de compras sugerida")}`,
-      `${md("/compras_tienda")} — ${md("compras sugeridas por tienda")}`,
-      "",
-      `${md("Formato")}:`,
-      code("Producto = cantidad"),
-      `${md("Ej")}:`,
-      code("Coca = 2"),
-    ].join("\n");
+    const html =
+      `<b>Ibérico Inventario</b>\n\n` +
+      `<code>/semana</code> — subir inventario semanal (foto o texto)\n` +
+      `<code>/ingreso</code> — subir compras (foto o texto)\n` +
+      `<code>/stock</code> — ver stock actual\n` +
+      `<code>/compras</code> — lista de compras sugerida\n` +
+      `<code>/compras_tienda</code> — compras sugeridas por tienda`;
 
-    return sendMessage(chatId, msg);
+    return sendMessage(chatId, html);
   }
 
   if (cmd === "/semana") {
     setMode(chatId, "semana");
-    const msg = [
-      b("Inventario semanal"),
-      "",
-      md("Envíame el inventario semanal en texto."),
-      `${md("Formato")}: ${code("Producto = cantidad")}`,
-      `${md("Ej")}: ${code("Absolut 750 ml = 1.5")}`,
-    ].join("\n");
-    return sendMessage(chatId, msg);
+    return sendMessage(
+      chatId,
+      `Envíame el <b>inventario semanal</b>.\n\n` +
+        `Por ahora puedes pegar texto así:\n` +
+        `<pre>Coca = 2\nAbsolut 750 ml = 1.5</pre>`
+    );
   }
 
   if (cmd === "/ingreso") {
     setMode(chatId, "ingreso");
-    const msg = [
-      b("Compras / Ingresos"),
-      "",
-      md("Envíame las compras en texto."),
-      `${md("Formato")}: ${code("Producto = cantidad")}`,
-      `${md("Ej")}: ${code("Coca = 6")}`,
-    ].join("\n");
-    return sendMessage(chatId, msg);
+    return sendMessage(
+      chatId,
+      `Envíame las <b>compras/ingresos</b>.\n\n` +
+        `Formato:\n` +
+        `<pre>Coca = 6\nTonica = 12</pre>`
+    );
   }
 
   if (cmd === "/stock") {
     const rows = await inventory.getStockActual();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, md("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
 
-    const header = b("Stock actual");
-    const lines = rows.map(r => `• ${md(r.name)}: *${md(fmtNum(r.stock_actual))}*`);
-    const out = [header, "", ...lines].join("\n");
+    const lines = rows.map(r => {
+      const name = escapeHtml(r.name);
+      const qty = Number(r.stock_actual || 0).toFixed(2);
+      return `• ${name}: <b>${qty}</b>`;
+    });
 
-    for (const part of chunkBySize(out)) await sendMessage(chatId, part);
-    return;
+    return sendMessage(chatId, `<b>Stock actual</b>\n\n${lines.join("\n")}`);
   }
 
   if (cmd === "/compras") {
     const rows = await inventory.getComprasSugeridas();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, md("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
 
-    const header = b("Compras sugeridas");
-    const lines = rows.map(r => `• ${md(r.name)}: *${md(fmtNum(r.faltante))}*`);
-    const out = [header, "", ...lines].join("\n");
+    const lines = rows.map(r => {
+      const name = escapeHtml(r.name);
+      const falt = Number(r.faltante || 0).toFixed(2);
+      return `• ${name}: <b>${falt}</b>`;
+    });
 
-    for (const part of chunkBySize(out)) await sendMessage(chatId, part);
-    return;
+    return sendMessage(chatId, `<b>Compras sugeridas</b>\n\n${lines.join("\n")}`);
   }
 
   if (cmd === "/compras_tienda") {
     const rows = await inventory.getComprasSugeridas();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, md("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
 
     const byStore = new Map();
     for (const r of rows) {
-      const store = r.store || "Sin tienda";
+      const store = String(r.store || "Sin tienda");
       if (!byStore.has(store)) byStore.set(store, []);
       byStore.get(store).push(r);
     }
 
-    const stores = Array.from(byStore.keys()).sort((a, b) => a.localeCompare(b, "es"));
-
-    let out = `${b("Compras sugeridas por tienda")}\n`;
-
-    for (const store of stores) {
-      const list = byStore.get(store) || [];
-      out += `\n${b(store)}\n`;
-      out += list.map(x => `• ${md(x.name)}: *${md(fmtNum(x.faltante))}*`).join("\n");
+    let out = `<b>Compras sugeridas por tienda</b>\n`;
+    for (const [store, list] of byStore.entries()) {
+      out += `\n<b>${escapeHtml(store)}</b>\n`;
+      out += list
+        .map(x => `• ${escapeHtml(x.name)}: <b>${Number(x.faltante || 0).toFixed(2)}</b>`)
+        .join("\n");
       out += "\n";
     }
 
-    out = out.trim();
-    for (const part of chunkBySize(out)) await sendMessage(chatId, part);
-    return;
+    return sendMessage(chatId, out.trim());
   }
 
-  return sendMessage(chatId, md("No entendí. Usa /menu."));
+  return sendMessage(chatId, `No entendí. Usa <code>/menu</code>.`);
 }
 
-// =========================
-// Non-command handler
-// =========================
 async function handleNonCommand(chatId, message) {
   const mode = getMode(chatId);
 
-  if (message?.text && mode) {
+  // MVP: texto directo
+  if (message.text && mode) {
     const parsed = parseLinesFromText(message.text);
-
     if (!parsed.length) {
-      const msg = [md("No pude leer el formato."), `${md("Usa")}: ${code("Producto = cantidad")}`].join("\n");
-      return sendMessage(chatId, msg);
+      return sendMessage(chatId, `No pude leer el formato. Usa:\n<pre>Producto = cantidad</pre>`);
     }
 
     const names = parsed.map(x => x.rawName);
@@ -196,30 +132,28 @@ async function handleNonCommand(chatId, message) {
     }
 
     if (missing.length) {
-      const msg =
-        `${b("No reconocí estos productos:")}\n` +
-        missing.map(x => `• ${md(x)}`).join("\n") +
-        "\n\n" +
-        md("Agrega alias o corrige el nombre y vuelve a enviar.");
-
-      for (const part of chunkBySize(msg)) await sendMessage(chatId, part);
-      return;
+      const m = missing.map(x => `• ${escapeHtml(x)}`).join("\n");
+      return sendMessage(
+        chatId,
+        `<b>No reconocí:</b>\n${m}\n\nCorrige el nombre o agrega alias.`
+      );
     }
 
     if (mode === "semana") {
       await inventory.resetCycleAndCreateSnapshot(lines);
       setMode(chatId, null);
-      return sendMessage(chatId, [md("Inventario semanal guardado ✅"), md("Usa /compras o /stock.")].join("\n"));
+      return sendMessage(chatId, `Inventario semanal guardado ✅\nUsa <code>/compras</code> o <code>/stock</code>.`);
     }
 
     if (mode === "ingreso") {
       await inventory.addPurchase(lines);
       setMode(chatId, null);
-      return sendMessage(chatId, [md("Compras guardadas ✅"), md("Usa /stock.")].join("\n"));
+      return sendMessage(chatId, `Compras guardadas ✅\nUsa <code>/stock</code>.`);
     }
   }
 
-  return sendMessage(chatId, md("Mándame /menu para ver comandos."));
+  // Foto/documento: lo conectamos después
+  return sendMessage(chatId, `Usa <code>/menu</code> para ver comandos.`);
 }
 
 module.exports = { handleCommand, handleNonCommand };
