@@ -3,25 +3,30 @@ const { sendMessage } = require("../services/telegramService");
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText } = require("../services/parserService");
 
-
-
 // =========================
 // MarkdownV2 helpers (Telegram)
 // =========================
 // Escapa caracteres especiales de MarkdownV2:
 // _ * [ ] ( ) ~ ` > # + - = | { } . ! \
 function esc(text) {
-  return String(text ?? "").replace(/([_*\[\]\(\)~`>#+\-=|{}.!\\])/g, "\\$1");
+  return String(text ?? "").replace(/([_*$begin:math:display$$end:math:display$$begin:math:text$$end:math:text$~`>#+\-=|{}.!\\])/g, "\\$1");
 }
 
-function mdBold(text) {
-  return `*${mdv2Escape(text)}*`;
+// Para comandos tipo /compras_tienda: SOLO escapamos "_" y "\" (suficiente y legible)
+function escCmd(text) {
+  return String(text ?? "").replace(/([_\\])/g, "\\$1");
 }
-function mdInlineCode(text) {
-  // Dentro de `code`, Telegram recomienda escapar ` y \ al menos
+
+function bold(text) {
+  return `*${esc(text)}*`;
+}
+
+function codeInline(text) {
+  // Inline code en MarkdownV2: escapamos ` y \
   const t = String(text ?? "").replace(/([`\\])/g, "\\$1");
   return `\`${t}\``;
 }
+
 function fmtNum(n) {
   const num = Number(n);
   return Number.isFinite(num) ? num.toFixed(2) : "0.00";
@@ -34,8 +39,7 @@ function chunkBySize(text, max = TG_MAX) {
   let buf = "";
 
   for (const line of String(text || "").split("\n")) {
-    // +1 por el salto
-    if ((buf.length + line.length + 1) > max) {
+    if (buf.length + line.length + 1 > max) {
       if (buf.trim()) parts.push(buf.trimEnd());
       buf = "";
     }
@@ -65,31 +69,33 @@ async function handleCommand(chatId, text) {
   const cmd = String(text || "").trim().split(/\s+/)[0];
 
   if (cmd === "/menu") {
-  const text =
-`*Ibérico Inventario*
+    // OJO: En MarkdownV2, "_" debe ir escapado
+    const menuText = [
+      bold("Ibérico Inventario"),
+      "",
+      `${escCmd("/semana")} — ${esc("subir inventario semanal")} ${esc("(texto por ahora)")}`,
+      `${escCmd("/ingreso")} — ${esc("subir compras")} ${esc("(texto por ahora)")}`,
+      `${escCmd("/stock")} — ${esc("ver stock actual")}`,
+      `${escCmd("/compras")} — ${esc("lista de compras sugerida")}`,
+      `${escCmd("/compras_tienda")} — ${esc("compras sugeridas por tienda")}`,
+      "",
+      `${esc("Formato")}:`,
+      codeInline("Producto = cantidad"),
+      `${esc("Ej")}:`,
+      codeInline("Coca = 2"),
+    ].join("\n");
 
-/semana — subir inventario semanal \\(texto por ahora\\)
-/ingreso — subir compras \\(texto por ahora\\)
-/stock — ver stock actual
-/compras — lista de compras sugerida
-/compras_tienda — compras sugeridas por tienda
-
-Formato:
-\`Producto = cantidad\`
-Ej:
-\`Coca = 2\``;
-
-  return sendMessage(chatId, text);
-}
+    return sendMessage(chatId, menuText);
+  }
 
   if (cmd === "/semana") {
     setMode(chatId, "semana");
     const msg = [
-      mdBold("Inventario semanal"),
+      bold("Inventario semanal"),
       "",
-      "Envíame el inventario semanal en texto.",
-      `Formato: ${mdInlineCode("Producto = cantidad")}`,
-      `Ej: ${mdInlineCode("Absolut 750 ml = 1.5")}`,
+      esc("Envíame el inventario semanal en texto."),
+      `${esc("Formato")}: ${codeInline("Producto = cantidad")}`,
+      `${esc("Ej")}: ${codeInline("Absolut 750 ml = 1.5")}`,
     ].join("\n");
     return sendMessage(chatId, msg);
   }
@@ -97,11 +103,11 @@ Ej:
   if (cmd === "/ingreso") {
     setMode(chatId, "ingreso");
     const msg = [
-      mdBold("Compras / Ingresos"),
+      bold("Compras / Ingresos"),
       "",
-      "Envíame las compras en texto.",
-      `Formato: ${mdInlineCode("Producto = cantidad")}`,
-      `Ej: ${mdInlineCode("Coca = 6")}`,
+      esc("Envíame las compras en texto."),
+      `${esc("Formato")}: ${codeInline("Producto = cantidad")}`,
+      `${esc("Ej")}: ${codeInline("Coca = 6")}`,
     ].join("\n");
     return sendMessage(chatId, msg);
   }
@@ -109,15 +115,11 @@ Ej:
   if (cmd === "/stock") {
     const rows = await inventory.getStockActual();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, mdv2Escape("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, esc("Aún no hay inventario semanal. Usa /semana."));
     }
 
-    const lines = rows.map(r => {
-      // name puede traer acentos, comillas, etc -> escapamos
-      return `• ${mdv2Escape(r.name)}: *${mdv2Escape(fmtNum(r.stock_actual))}*`;
-    });
-
-    const header = mdBold("Stock actual");
+    const header = bold("Stock actual");
+    const lines = rows.map(r => `• ${esc(r.name)}: *${esc(fmtNum(r.stock_actual))}*`);
     const out = [header, "", ...lines].join("\n");
 
     for (const part of chunkBySize(out)) {
@@ -129,14 +131,11 @@ Ej:
   if (cmd === "/compras") {
     const rows = await inventory.getComprasSugeridas();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, mdv2Escape("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, esc("Aún no hay inventario semanal. Usa /semana."));
     }
 
-    const lines = rows.map(r => {
-      return `• ${mdv2Escape(r.name)}: *${mdv2Escape(fmtNum(r.faltante))}*`;
-    });
-
-    const header = mdBold("Compras sugeridas");
+    const header = bold("Compras sugeridas");
+    const lines = rows.map(r => `• ${esc(r.name)}: *${esc(fmtNum(r.faltante))}*`);
     const out = [header, "", ...lines].join("\n");
 
     for (const part of chunkBySize(out)) {
@@ -148,7 +147,7 @@ Ej:
   if (cmd === "/compras_tienda") {
     const rows = await inventory.getComprasSugeridas();
     if (rows?.error === "no_snapshot") {
-      return sendMessage(chatId, mdv2Escape("Aún no hay inventario semanal. Usa /semana."));
+      return sendMessage(chatId, esc("Aún no hay inventario semanal. Usa /semana."));
     }
 
     const byStore = new Map();
@@ -158,15 +157,16 @@ Ej:
       byStore.get(store).push(r);
     }
 
-    let out = `${mdBold("Compras sugeridas por tienda")}\n`;
-
-    // Orden alfabético de tiendas para que siempre salga igual
+    // Orden alfabético para salida estable
     const stores = Array.from(byStore.keys()).sort((a, b) => a.localeCompare(b, "es"));
+
+    let out = `${bold("Compras sugeridas por tienda")}\n`;
+
     for (const store of stores) {
       const list = byStore.get(store) || [];
-      out += `\n${mdBold(store)}\n`;
+      out += `\n${bold(store)}\n`;
       out += list
-        .map(x => `• ${mdv2Escape(x.name)}: *${mdv2Escape(fmtNum(x.faltante))}*`)
+        .map(x => `• ${esc(x.name)}: *${esc(fmtNum(x.faltante))}*`)
         .join("\n");
       out += "\n";
     }
@@ -179,7 +179,7 @@ Ej:
     return;
   }
 
-  return sendMessage(chatId, mdv2Escape("No entendí. Usa /menu."));
+  return sendMessage(chatId, esc("No entendí. Usa /menu."));
 }
 
 // =========================
@@ -193,8 +193,8 @@ async function handleNonCommand(chatId, message) {
     const parsed = parseLinesFromText(message.text);
     if (!parsed.length) {
       const msg = [
-        mdv2Escape("No pude leer el formato."),
-        `Usa: ${mdInlineCode("Producto = cantidad")}`,
+        esc("No pude leer el formato."),
+        `${esc("Usa")}: ${codeInline("Producto = cantidad")}`,
       ].join("\n");
       return sendMessage(chatId, msg);
     }
@@ -215,12 +215,11 @@ async function handleNonCommand(chatId, message) {
     }
 
     if (missing.length) {
-      // Lista de no reconocidos, escapados
       const msg =
-        `${mdBold("No reconocí estos productos:")}\n` +
-        missing.map(x => `• ${mdv2Escape(x)}`).join("\n") +
+        `${bold("No reconocí estos productos:")}\n` +
+        missing.map(x => `• ${esc(x)}`).join("\n") +
         "\n\n" +
-        mdv2Escape("Agrega alias o corrige el nombre y vuelve a enviar.");
+        esc("Agrega alias o corrige el nombre y vuelve a enviar.");
 
       for (const part of chunkBySize(msg)) {
         await sendMessage(chatId, part);
@@ -232,9 +231,9 @@ async function handleNonCommand(chatId, message) {
       await inventory.resetCycleAndCreateSnapshot(lines);
       setMode(chatId, null);
       const msg = [
-        "Inventario semanal guardado ✅",
-        "Usa /compras o /stock.",
-      ].map(mdv2Escape).join("\n");
+        esc("Inventario semanal guardado ✅"),
+        esc("Usa /compras o /stock."),
+      ].join("\n");
       return sendMessage(chatId, msg);
     }
 
@@ -242,15 +241,15 @@ async function handleNonCommand(chatId, message) {
       await inventory.addPurchase(lines);
       setMode(chatId, null);
       const msg = [
-        "Compras guardadas ✅",
-        "Usa /stock.",
-      ].map(mdv2Escape).join("\n");
+        esc("Compras guardadas ✅"),
+        esc("Usa /stock."),
+      ].join("\n");
       return sendMessage(chatId, msg);
     }
   }
 
   // Foto/documento: siguiente paso (IA)
-  return sendMessage(chatId, mdv2Escape("Mándame /menu para ver comandos."));
+  return sendMessage(chatId, esc("Mándame /menu para ver comandos."));
 }
 
 module.exports = { handleCommand, handleNonCommand };
