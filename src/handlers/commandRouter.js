@@ -3,14 +3,17 @@ const { sendMessage } = require("../services/telegramService");
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText } = require("../services/parserService");
 
+
+
 // =========================
 // MarkdownV2 helpers (Telegram)
 // =========================
 // Escapa caracteres especiales de MarkdownV2:
 // _ * [ ] ( ) ~ ` > # + - = | { } . ! \
-function mdv2Escape(text) {
-  return String(text ?? "").replace(/([_*$begin:math:display$$end:math:display$$begin:math:text$$end:math:text$~`>#+\-=|{}.!\\])/g, "\\$1");
+function esc(text) {
+  return String(text ?? "").replace(/([_*\[\]\(\)~`>#+\-=|{}.!\\])/g, "\\$1");
 }
+
 function mdBold(text) {
   return `*${mdv2Escape(text)}*`;
 }
@@ -62,21 +65,22 @@ async function handleCommand(chatId, text) {
   const cmd = String(text || "").trim().split(/\s+/)[0];
 
   if (cmd === "/menu") {
-    const menuText = [
-      mdBold("Ibérico Inventario"),
-      "",
-      `${mdv2Escape("/semana")} — subir inventario semanal (texto por ahora)`,
-      `${mdv2Escape("/ingreso")} — subir compras (texto por ahora)`,
-      `${mdv2Escape("/stock")} — ver stock actual`,
-      `${mdv2Escape("/compras")} — lista de compras sugerida`,
-      `${mdv2Escape("/compras_tienda")} — compras sugeridas por tienda`,
-      "",
-      `Formato: ${mdInlineCode("Producto = cantidad")}`,
-      `Ej: ${mdInlineCode("Coca = 2")}`,
-    ].join("\n");
+  const text =
+`*Ibérico Inventario*
 
-    return sendMessage(chatId, menuText);
-  }
+/semana — subir inventario semanal \\(texto por ahora\\)
+/ingreso — subir compras \\(texto por ahora\\)
+/stock — ver stock actual
+/compras — lista de compras sugerida
+/compras_tienda — compras sugeridas por tienda
+
+Formato:
+\`Producto = cantidad\`
+Ej:
+\`Coca = 2\``;
+
+  return sendMessage(chatId, text);
+}
 
   if (cmd === "/semana") {
     setMode(chatId, "semana");

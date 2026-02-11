@@ -15,14 +15,13 @@ function escapeMarkdownV2(text) {
 // mejor envíalo como preformateado sin parsear o en HTML.
 // Aquí vamos a evitar code blocks en mensajes normales.
 async function sendMessage(chatId, text, opts = {}) {
-  const safe = escapeMarkdownV2(text);
-
   return axios.post(`${api}/sendMessage`, {
     chat_id: chatId,
-    text: safe,
+    text: String(text ?? ""),
     parse_mode: "MarkdownV2",
     ...opts,
   });
 }
+
 
 module.exports = { sendMessage, escapeMarkdownV2 };
