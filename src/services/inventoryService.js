@@ -1,3 +1,4 @@
+// src/services/inventoryService.js
 const db = require("../db");
 
 async function getActiveSnapshotId() {
@@ -76,22 +77,26 @@ async function getComprasSugeridas() {
     select
       p.id as product_id,
       p.name,
-      s.name as store,
+      st.name as store,
       p.base_qty,
       coalesce(il.qty,0) as snapshot_qty,
-      greatest(p.base_qty - coalesce(il.qty,0), 0) as faltante
+      coalesce(il.qty,0) + coalesce(sum(pl.qty),0) as stock_actual,
+      greatest(p.base_qty - (coalesce(il.qty,0) + coalesce(sum(pl.qty),0)), 0) as faltante
     from products p
-    join stores s on s.id = p.store_id
+    join stores st on st.id = p.store_id
     left join inventory_lines il
       on il.product_id = p.id and il.snapshot_id = $1
+    left join purchase_lines pl
+      on pl.product_id = p.id
     where p.active = true
       and p.base_qty > 0
-    order by s.name, p.name
+    group by p.id, p.name, st.name, p.base_qty, il.qty
+    order by st.name, p.name
     `,
     [snapshotId]
   );
 
-  return rows.filter(r => Number(r.faltante) > 0);
+  return rows.filter((r) => Number(r.faltante) > 0);
 }
 
 async function getStockActual() {
@@ -119,10 +124,15 @@ async function getStockActual() {
   return rows;
 }
 
+async function updateBaseQty(productId, baseQty) {
+  await db.query(`update products set base_qty = $2 where id = $1`, [productId, baseQty]);
+}
+
 module.exports = {
   resetCycleAndCreateSnapshot,
   addPurchase,
   resolveProductsByNames,
   getComprasSugeridas,
   getStockActual,
+  updateBaseQty,
 };

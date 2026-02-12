@@ -1,12 +1,6 @@
 // src/handlers/commandRouter.js
 const db = require("../db");
-const {
-  sendMessage,
-  escapeHtml,
-  getFile,
-  downloadFile,
-} = require("../services/telegramService");
-
+const { sendMessage, escapeHtml, getFile, downloadFile } = require("../services/telegramService");
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText, extractItemsFromBuffer } = require("../services/parserService");
 
@@ -17,8 +11,7 @@ function startBatch(chatId, mode) {
   state.set(chatId, {
     mode,
     batch: {
-      // product_id -> qty acumulada (sumamos por si un producto aparece en 2 fotos)
-      linesByProductId: new Map(),
+      linesByProductId: new Map(), // product_id -> qty
       rawSeen: 0,
     },
   });
@@ -56,10 +49,18 @@ function pickTelegramFileFromMessage(message) {
   return null;
 }
 
+// Para semana/ingreso: SUMA
 function mergeLines(batch, resolvedLines /* [{product_id, qty}] */) {
   for (const l of resolvedLines) {
     const prev = Number(batch.linesByProductId.get(l.product_id) || 0);
     batch.linesByProductId.set(l.product_id, prev + Number(l.qty || 0));
+  }
+}
+
+// Para base: REEMPLAZA
+function setLines(batch, resolvedLines /* [{product_id, qty}] */) {
+  for (const l of resolvedLines) {
+    batch.linesByProductId.set(l.product_id, Number(l.qty || 0));
   }
 }
 
@@ -68,6 +69,16 @@ function batchToLines(batch) {
     product_id,
     qty,
   }));
+}
+
+function parseBaseInline(rest) {
+  // "Producto = 12" (decimal con punto o coma)
+  const m = String(rest || "").trim().match(/^(.+?)\s*=\s*([0-9]+(?:[.,][0-9]+)?)$/);
+  if (!m) return null;
+  const rawName = String(m[1]).trim();
+  const qty = Number(String(m[2]).replace(",", "."));
+  if (!Number.isFinite(qty)) return null;
+  return { rawName, qty };
 }
 
 async function handleCommand(chatId, text) {
@@ -79,11 +90,12 @@ async function handleCommand(chatId, text) {
       `<b>Ibérico Inventario</b>\n\n` +
       `<code>/semana</code> — iniciar lote inventario semanal (manda 2 fotos: Alcohol y Cocina, luego <code>/fin</code>)\n` +
       `<code>/ingreso</code> — iniciar lote compras (manda 1 o más fotos, luego <code>/fin</code>)\n` +
+      `<code>/base</code> — cambiar stock base (ej: <code>/base Tonica = 60</code> o en lote)\n` +
       `<code>/fin</code> — guardar lote actual\n` +
       `<code>/cancel</code> — cancelar lote actual\n\n` +
       `<code>/stock</code> — ver stock actual\n` +
-      `<code>/compras</code> — lista de compras sugerida\n` +
-      `<code>/compras_tienda</code> — compras sugeridas por tienda`;
+      `<code>/compras</code> — lista de compras sugerida (incluye stock actual)\n` +
+      `<code>/compras_tienda</code> — compras sugeridas por tienda (incluye stock actual)`;
 
     return sendMessage(chatId, html);
   }
@@ -95,7 +107,7 @@ async function handleCommand(chatId, text) {
   }
 
   if (cmd === "/fin") {
-    if (!st) return sendMessage(chatId, `No hay lote activo. Usa <code>/semana</code> o <code>/ingreso</code>.`);
+    if (!st) return sendMessage(chatId, `No hay lote activo. Usa <code>/semana</code>, <code>/ingreso</code> o <code>/base</code>.`);
 
     const lines = batchToLines(st.batch);
     if (!lines.length) {
@@ -113,6 +125,14 @@ async function handleCommand(chatId, text) {
       await inventory.addPurchase(lines);
       clearBatch(chatId);
       return sendMessage(chatId, `Compras guardadas ✅\nUsa <code>/stock</code>.`);
+    }
+
+    if (st.mode === "base") {
+      for (const l of lines) {
+        await inventory.updateBaseQty(l.product_id, l.qty);
+      }
+      clearBatch(chatId);
+      return sendMessage(chatId, `Stock base actualizado ✅ (${lines.length} productos)`);
     }
 
     clearBatch(chatId);
@@ -141,6 +161,31 @@ async function handleCommand(chatId, text) {
     );
   }
 
+  if (cmd === "/base") {
+    const rest = String(text || "").replace(/^\/base\s*/i, "").trim();
+
+    // /base Producto = 12
+    const inline = parseBaseInline(rest);
+    if (inline) {
+      const map = await inventory.resolveProductsByNames([inline.rawName]);
+      const resolved = map.get(inline.rawName);
+      if (!resolved) {
+        return sendMessage(chatId, `No reconocí el producto: <code>${escapeHtml(inline.rawName)}</code>`);
+      }
+      await inventory.updateBaseQty(resolved.product_id, inline.qty);
+      return sendMessage(chatId, `Stock base actualizado ✅\n• ${escapeHtml(resolved.name)} → <b>${inline.qty.toFixed(2)}</b>`);
+    }
+
+    // /base (modo lote)
+    startBatch(chatId, "base");
+    return sendMessage(
+      chatId,
+      `Modo edición de <b>stock base</b> ✅\n` +
+        `Pega líneas así:\n<pre>Coca = 4\nTonica = 60</pre>\n` +
+        `Luego: <code>/fin</code> para guardar o <code>/cancel</code>`
+    );
+  }
+
   if (cmd === "/stock") {
     const rows = await inventory.getStockActual();
     if (rows?.error === "no_snapshot") {
@@ -155,7 +200,15 @@ async function handleCommand(chatId, text) {
     if (rows?.error === "no_snapshot") {
       return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
-    const lines = rows.map((r) => `• ${escapeHtml(r.name)}: <b>${Number(r.faltante || 0).toFixed(2)}</b>`);
+
+    const lines = rows.map((r) => {
+      const name = escapeHtml(r.name);
+      const falt = Number(r.faltante || 0).toFixed(2);
+      const hay = Number(r.stock_actual || 0).toFixed(2);
+      const base = Number(r.base_qty || 0).toFixed(2);
+      return `• ${name}: <b>comprar ${falt}</b> <code>(hay ${hay} / base ${base})</code>`;
+    });
+
     return sendMessage(chatId, `<b>Compras sugeridas</b>\n\n${lines.join("\n")}`);
   }
 
@@ -176,7 +229,12 @@ async function handleCommand(chatId, text) {
     for (const [store, list] of byStore.entries()) {
       out += `\n<b>${escapeHtml(store)}</b>\n`;
       out += list
-        .map((x) => `• ${escapeHtml(x.name)}: <b>${Number(x.faltante || 0).toFixed(2)}</b>`)
+        .map((x) => {
+          const falt = Number(x.faltante || 0).toFixed(2);
+          const hay = Number(x.stock_actual || 0).toFixed(2);
+          const base = Number(x.base_qty || 0).toFixed(2);
+          return `• ${escapeHtml(x.name)}: <b>comprar ${falt}</b> <code>(hay ${hay} / base ${base})</code>`;
+        })
         .join("\n");
       out += "\n";
     }
@@ -184,7 +242,6 @@ async function handleCommand(chatId, text) {
     return sendMessage(chatId, out.trim());
   }
 
-  // Si hay lote activo, recordatorio útil
   if (st) {
     return sendMessage(chatId, `Tienes un lote activo (<code>${escapeHtml(st.mode)}</code>). Envía foto o <code>/fin</code>.`);
   }
@@ -202,7 +259,7 @@ async function handleNonCommand(chatId, message) {
     return sendMessage(chatId, `Usa <code>/menu</code>.`);
   }
 
-  // TEXTO (permite sumar al lote)
+  // TEXTO (para semana/ingreso/base)
   if (message.text) {
     const parsed = parseLinesFromText(message.text);
     if (!parsed.length) {
@@ -228,16 +285,23 @@ async function handleNonCommand(chatId, message) {
       );
     }
 
-    mergeLines(st.batch, resolvedLines);
-    st.batch.rawSeen += resolvedLines.length;
+    if (st.mode === "base") {
+      setLines(st.batch, resolvedLines); // reemplaza
+      st.batch.rawSeen += resolvedLines.length;
+      return sendMessage(chatId, `Base en lote ✅ (${st.batch.linesByProductId.size} productos listos). Usa <code>/fin</code>.`);
+    }
 
-    return sendMessage(
-      chatId,
-      `Agregado al lote ✅ (${st.batch.linesByProductId.size} productos acumulados)\nCuando termines: <code>/fin</code>`
-    );
+    mergeLines(st.batch, resolvedLines); // suma
+    st.batch.rawSeen += resolvedLines.length;
+    return sendMessage(chatId, `Agregado al lote ✅ (${st.batch.linesByProductId.size} productos acumulados)\nCuando termines: <code>/fin</code>`);
   }
 
-  // FOTO / DOCUMENTO
+  // En modo base NO aceptamos foto (solo texto)
+  if (st.mode === "base") {
+    return sendMessage(chatId, `Para cambiar stock base usa texto:\n<pre>Producto = cantidad</pre>\nLuego <code>/fin</code>.`);
+  }
+
+  // FOTO / DOCUMENTO (semana/ingreso)
   const fileMeta = pickTelegramFileFromMessage(message);
   if (!fileMeta) {
     return sendMessage(chatId, `Envíame una <b>foto</b> del formato o texto <pre>Producto = cantidad</pre>.`);
@@ -288,8 +352,7 @@ async function handleNonCommand(chatId, message) {
       await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, `missing_products:${missing.join(",")}`]);
       return sendMessage(
         chatId,
-        `<b>Leí la foto, pero no reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\n` +
-          `Agrega alias y reintenta.\nIngest: <code>${ingestId}</code>`
+        `<b>Leí la foto, pero no reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\nAgrega alias y reintenta.\nIngest: <code>${ingestId}</code>`
       );
     }
 
@@ -298,17 +361,11 @@ async function handleNonCommand(chatId, message) {
 
     await db.query(`update ingests set status='processed' where id=$1`, [ingestId]);
 
-    return sendMessage(
-      chatId,
-      `Foto agregada al lote ✅\n` +
-        `Acumulado: <b>${st.batch.linesByProductId.size}</b> productos\n` +
-        `Cuando termines: <code>/fin</code>`
-    );
+    return sendMessage(chatId, `Foto agregada al lote ✅\nAcumulado: <b>${st.batch.linesByProductId.size}</b> productos\nCuando termines: <code>/fin</code>`);
   } catch (e) {
     const msg = e?.message || "unknown_error";
     await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, msg]);
 
-    // Caso típico: PDF
     if (String(msg).startsWith("unsupported_mime:")) {
       return sendMessage(chatId, `Eso parece PDF/documento raro.\nEnvíalo como <b>Foto</b> (no archivo) y reintenta ✅`);
     }
