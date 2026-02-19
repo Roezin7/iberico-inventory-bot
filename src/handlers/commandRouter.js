@@ -278,12 +278,40 @@ async function handleNonCommand(chatId, message) {
       else resolvedLines.push({ product_id: resolved.product_id, qty: it.qty });
     }
 
-    if (missing.length) {
-      return sendMessage(
-        chatId,
-        `<b>No reconocí:</b>\n${missing.map((x) => `• ${escapeHtml(x)}`).join("\n")}\n\nAgrega alias y reintenta.`
-      );
-    }
+    // ✅ Si hay reconocidos, SIEMPRE los guardamos
+if (resolvedLines.length) {
+  mergeLines(st.batch, resolvedLines);
+  st.batch.rawSeen += resolvedLines.length;
+}
+
+// ✅ Si hubo faltantes, avisamos PERO NO abortamos
+if (missing.length) {
+  await db.query(
+    `update ingests set status='processed_with_missing', error=$2 where id=$1`,
+    [ingestId, `missing_products:${missing.join(",")}`]
+  );
+
+  const missMsg = missing.map(x => `• ${escapeHtml(x)}`).join("\n");
+
+  return sendMessage(
+    chatId,
+    `Foto agregada al lote ✅\n` +
+      `Acumulado: <b>${st.batch.linesByProductId.size}</b> productos\n\n` +
+      `<b>Ojo, faltaron:</b>\n${missMsg}\n\n` +
+      `Puedes agregar alias y volver a mandar esa foto, o seguimos.\n` +
+      `Cuando termines: <code>/fin</code>`
+  );
+}
+
+// si no hubo missing:
+await db.query(`update ingests set status='processed' where id=$1`, [ingestId]);
+
+return sendMessage(
+  chatId,
+  `Foto agregada al lote ✅\n` +
+    `Acumulado: <b>${st.batch.linesByProductId.size}</b> productos\n` +
+    `Cuando termines: <code>/fin</code>`
+);
 
     if (st.mode === "base") {
       setLines(st.batch, resolvedLines); // reemplaza
@@ -330,6 +358,8 @@ async function handleNonCommand(chatId, message) {
       buffer,
       mimeType: fileMeta.mimeType,
     });
+
+    await sendMessage(chatId, `IA leyó: <b>${extracted.length}</b> filas 📄`);
 
     if (!extracted?.length) {
       await db.query(`update ingests set status='failed', error=$2 where id=$1`, [ingestId, "extractor_returned_empty"]);
