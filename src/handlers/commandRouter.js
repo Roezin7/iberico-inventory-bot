@@ -10,6 +10,7 @@ const {
 const inventory = require("../services/inventoryService");
 const { parseLinesFromText, extractItemsFromBuffer } = require("../services/parserService");
 const { cleanHumanText, parseAliasMappingLine, parseNameQtyLine } = require("../utils/textUtils");
+const wealthTelegram = require("./wealth/telegram");
 
 // state: chatId -> { mode, batch: { linesByProductId: Map<number, number>, rawSeen: number } }
 const state = new Map();
@@ -257,6 +258,13 @@ async function resolveItemsToBatchLines(items) {
 async function handleCommand(chatId, text) {
   const cmd = String(text || "").trim().split(/\s+/)[0];
   const st = getState(chatId);
+  const wealthResult = await wealthTelegram.handleCommand({
+    chatId,
+    text,
+    hasConflictingBatch: Boolean(st),
+  });
+  if (wealthResult) return wealthResult;
+  const wealthSessionActive = wealthTelegram.hasSession(chatId);
 
   if (cmd === "/menu") {
     const html =
@@ -264,6 +272,11 @@ async function handleCommand(chatId, text) {
       `<code>/semana</code> — iniciar lote inventario semanal\n` +
       `<code>/ingreso</code> — iniciar lote compras\n` +
       `<code>/base</code> — cambiar stock base\n` +
+      `<code>/valor_semanal</code> — registrar valor total del negocio\n` +
+      `<code>/valor_total</code> — ver ultimo corte total del negocio\n` +
+      `<code>/valor_historial</code> — ver historial de valor semanal\n` +
+      `<code>/valor_cambio</code> — comparar ultimo corte contra el anterior\n` +
+      `<code>/valor_mes</code> — resumen de ultimas semanas\n` +
       `<code>/base_show</code> — ver stock base actual\n` +
       `<code>/faltantes</code> — listar productos activos faltantes del snapshot actual\n` +
       `<code>/alias_add</code> — agregar alias <code>/alias_add Alias = Producto</code>\n` +
@@ -323,6 +336,13 @@ async function handleCommand(chatId, text) {
 
     clearBatch(chatId);
     return sendMessage(chatId, `Modo inválido. Usa <code>/menu</code>.`);
+  }
+
+  if (wealthSessionActive && ["/semana", "/ingreso", "/base"].includes(cmd)) {
+    return sendMessage(
+      chatId,
+      `Tienes un registro de valor semanal en progreso. Termínalo o usa <code>/cancel</code> antes de abrir otro modo interactivo.`
+    );
   }
 
   if (cmd === "/semana") {
@@ -543,27 +563,28 @@ async function handleCommand(chatId, text) {
   }
 
   if (cmd === "/valor_inventario") {
-    const summary = await inventory.getInventoryValueSummary();
+    const summary = await inventory.getCurrentInventoryValue();
     if (summary?.error === "no_snapshot") {
       return sendMessage(chatId, `Aún no hay inventario semanal. Usa <code>/semana</code>.`);
     }
 
     let html =
       `<b>Valor total del inventario</b>\n\n` +
-      `Total valorizado: <b>${escapeHtml(formatCurrency(summary.total_inventory_value))}</b>\n` +
+      `Total valorizado: <b>${escapeHtml(formatCurrency(summary.inventory_value))}</b>\n` +
+      `Productos con stock: <b>${summary.total_products}</b>\n` +
+      `Productos valorizados: <b>${summary.valued_products}</b>\n` +
       `Productos sin costo: <b>${summary.missing_cost_count}</b>`;
 
-    if (summary.stores.length) {
-      html += `\n\n<b>Por tienda</b>\n`;
-      html += summary.stores
-        .map((store) => {
-          const suffix = store.missing_cost_count
-            ? ` <code>(${store.missing_cost_count} sin costo)</code>`
-            : "";
-          return `• ${escapeHtml(store.store)}: <b>${escapeHtml(
-            formatCurrency(store.total_inventory_value)
-          )}</b>${suffix}`;
-        })
+    if (summary.missing_cost_products.length) {
+      html += `\n\n<b>Fuera por falta de costo</b>\n`;
+      html += summary.missing_cost_products
+        .slice(0, 10)
+        .map(
+          (product) =>
+            `• ${escapeHtml(product.name)} <code>(${escapeHtml(product.store)} / stock ${formatQty(
+              product.stock_actual
+            )})</code>`
+        )
         .join("\n");
     }
 
@@ -671,6 +692,9 @@ async function handleCommand(chatId, text) {
 }
 
 async function handleNonCommand(chatId, message) {
+  const wealthResult = await wealthTelegram.handleNonCommand({ chatId, message });
+  if (wealthResult) return wealthResult;
+
   const st = getState(chatId);
 
   if (!st) {

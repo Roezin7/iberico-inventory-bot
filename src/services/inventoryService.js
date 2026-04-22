@@ -334,7 +334,7 @@ async function addProductAliasByNames({ alias, productName }) {
   return addProductAlias(outcome.product_id, alias);
 }
 
-async function getCurrentStockRows() {
+async function getCurrentStockRows({ onlyPositiveBaseQty = false } = {}) {
   const snapshot = await getActiveSnapshot();
   if (!snapshot) return { error: "no_snapshot" };
 
@@ -374,7 +374,7 @@ async function getCurrentStockRows() {
       on il.product_id = p.id and il.snapshot_id = $2
     left join purchase_totals pt on pt.product_id = p.id
     where p.active = true
-      and p.base_qty > 0
+      ${onlyPositiveBaseQty ? "and p.base_qty > 0" : ""}
     order by st.name, p.name
     `,
     [snapshot.created_at, snapshot.id]
@@ -384,7 +384,7 @@ async function getCurrentStockRows() {
 }
 
 async function getComprasSugeridas() {
-  const rows = await getCurrentStockRows();
+  const rows = await getCurrentStockRows({ onlyPositiveBaseQty: true });
   if (rows?.error === "no_snapshot") return rows;
 
   return rows.filter((row) => Number(row.faltante) > 0);
@@ -432,6 +432,33 @@ async function getInventoryValueSummary() {
     stores: Array.from(totalsByStore.values()).sort((a, b) =>
       a.store.localeCompare(b.store, "es", { sensitivity: "base" })
     ),
+  };
+}
+
+async function getCurrentInventoryValue() {
+  const rows = await getCurrentStockRows();
+  if (rows?.error === "no_snapshot") return rows;
+
+  const rowsWithStock = rows.filter((row) => Number(row.stock_actual || 0) > 0);
+  const missingCostRows = rows.filter(
+    (row) => row.unit_cost === null && Number(row.stock_actual || 0) > 0
+  );
+  const valuedRows = rows.filter((row) => row.unit_cost !== null && Number(row.stock_actual || 0) > 0);
+
+  return {
+    inventory_value: valuedRows.reduce(
+      (sum, row) => sum + Number(row.inventory_value || 0),
+      0
+    ),
+    total_products: rowsWithStock.length,
+    valued_products: valuedRows.length,
+    missing_cost_count: missingCostRows.length,
+    missing_cost_products: missingCostRows.map((row) => ({
+      product_id: row.product_id,
+      name: row.name,
+      store: row.store,
+      stock_actual: Number(row.stock_actual || 0),
+    })),
   };
 }
 
@@ -532,6 +559,7 @@ module.exports = {
   getBaseStockList,
   getComprasSugeridas,
   getCurrentStockRows,
+  getCurrentInventoryValue,
   getInventoryValueByProductName,
   getInventoryValueSummary,
   getMissingProductsInActiveSnapshot,
