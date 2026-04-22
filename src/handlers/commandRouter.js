@@ -782,6 +782,7 @@ async function handleNonCommand(chatId, message) {
       mode: st.mode,
       buffer,
       mimeType: fileMeta.mimeType,
+      fileName: fileMeta.fileName,
     });
 
     await sendMessage(chatId, `IA leyó: <b>${extracted.length}</b> filas 📄`);
@@ -822,8 +823,8 @@ async function handleNonCommand(chatId, message) {
     return sendMessage(
       chatId,
       buildBatchOutcomeMessage({
-        successLabel: "Foto agregada",
-        sourceLabel: "foto",
+        successLabel: fileMeta.kind === "document" ? "Archivo agregado" : "Foto agregada",
+        sourceLabel: fileMeta.kind === "document" ? "archivo" : "foto",
         batch: st.batch,
         resolvedCount: resolvedLines.length,
         missingNames,
