@@ -7,6 +7,25 @@ const pool = new Pool({
     : undefined,
 });
 
+async function withTransaction(run) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("begin");
+    const result = await run(client);
+    await client.query("commit");
+    return result;
+  } catch (error) {
+    try {
+      await client.query("rollback");
+    } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   query: (text, params) => pool.query(text, params),
+  withTransaction,
 };

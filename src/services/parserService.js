@@ -1,6 +1,11 @@
 // src/services/parserService.js
 const OpenAI = require("openai");
 const sharp = require("sharp");
+const {
+  cleanHumanText,
+  parseFlexibleNumber,
+  parseNameQtyLine,
+} = require("../utils/textUtils");
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -8,13 +13,10 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-5.2";
 
 function toNum(x) {
-  if (x === null || x === undefined) return null;
-  const s = String(x).trim().replace(/\s+/g, "").replace(",", ".");
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  return parseFlexibleNumber(x);
 }
 function cleanName(s) {
-  return String(s || "").trim().replace(/\s+/g, " ");
+  return cleanHumanText(s);
 }
 function safeJsonParse(str) {
   try {
@@ -38,18 +40,14 @@ function safeJsonParse(str) {
 // Texto: "Producto = cantidad"
 function parseLinesFromText(text) {
   const lines = String(text || "")
-    .split("\n")
-    .map((x) => x.trim())
+    .split(/\r?\n/)
+    .map((x) => cleanHumanText(x))
     .filter(Boolean);
 
   const items = [];
   for (const line of lines) {
-    const m = line.match(/^(.+?)\s*=\s*([0-9]+(?:[.,][0-9]+)?)$/);
-    if (!m) continue;
-    const rawName = cleanName(m[1]);
-    const qty = toNum(m[2]);
-    if (!rawName || qty === null) continue;
-    items.push({ rawName, qty });
+    const parsed = parseNameQtyLine(line);
+    if (parsed) items.push(parsed);
   }
   return items;
 }
